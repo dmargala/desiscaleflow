@@ -1,0 +1,44 @@
+#!/bin/bash
+# Wrapper script to redirect output to a file
+
+scriptname=$(basename $0)
+
+print_usage() {
+    printf "Usage: \n\n"
+    printf "  $scriptname [-q] LOGFILE ...\n\n"
+    printf "Typical usage between <srun/mpirun> and <command>: \n\n"
+    printf "  srun -n 2 $scriptname mylog.out command arg1 arg2 ... \n\n"
+    printf "Copy to stdout in addition to redirecting to individual files: \n\n"
+    printf "  srun -n 2 $scriptname -q mylog.out command arg1 arg2 ... \n\n"
+}
+
+QUIET=0
+
+while getopts 'q' flag; do
+    case "${flag}" in
+        q) QUIET=1 ;;
+        *) print_usage
+           exit 1 ;;
+    esac
+done
+# Remove flags that have been processed from arg list
+shift $((OPTIND-1))
+
+LOGFILE=$1.${SLURM_NODEID}.${SLURM_LOCALID}
+
+# consume first argument
+shift
+
+# empty contents of log file
+> $LOGFILE
+
+if [ $QUIET -eq 0 ]; then
+    # write to stdout and logfile
+    exec &> >(tee -a $LOGFILE)
+else
+    # only write to logfile
+    exec &> $LOGFILE
+fi
+
+exec "$@"
+

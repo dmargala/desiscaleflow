@@ -1,0 +1,32 @@
+channels:
+ - defaults
+dependencies:
+ - python=3.8
+ - cython
+ - numpy=1.19.1
+ - scipy=1.5.0
+ - h5py
+ - numba
+ - pyyaml
+ - matplotlib
+ - pytest
+ - psutil
+ - ipython
+ - ipykernel
+ - ipywidgets
+ - seaborn
+ - pandas
+ - pip
+ - pip:
+   - astropy==4.1
+   - fitsio
+   - healpy==1.14.0
+   - speclite==0.13
+   - tqdm
+variables:
+  DESI_SPECTRO_DATA: /global/cfs/cdirs/desi/spectro/data
+  DESI_SPECTRO_REDUX: /global/cfs/cdirs/desi/spectro/redux
+  DESI_SPECTRO_CALIB: /global/cfs/cdirs/desi/spectro/desi_spectro_calib/0.2.7
+  DESI_BASIS_TEMPLATES: /global/cfs/cdirs/desi/spectro/templates/basis_templates/v3.2
+  DESIMODEL: /global/common/software/desi/cori/desiconda/20200801-1.4.0-spec/code/desimodel/0.16.0
+  RR_TEMPLATE_DIR: /global/common/software/desi/cori/desiconda/20200801-1.4.0-spec/code/redrock-templates/0.7.2

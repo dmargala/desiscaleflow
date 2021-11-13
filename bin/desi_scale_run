@@ -1,0 +1,907 @@
+#!/usr/bin/env python
+
+import time
+start_imports = time.time()
+
+import argparse
+from dataclasses import dataclass, field, asdict
+import datetime
+import glob
+import json
+import math
+import os
+from typing import List
+
+import pandas as pd
+import cupy
+
+import desispec.io
+import desiutil.timer
+from desiutil.log import get_logger, INFO
+from desispec.io import findfile
+from desispec.io.fibermap import assemble_fibermap
+from desispec.io.util import decode_camword, create_camword
+import desispec.scripts.proc as proc
+import desispec.scripts.proc_joint_fit as proc_joint_fit
+import desispec.scripts.group_spectra as group_spectra
+import desispec.scripts.coadd_spectra as coadd_spectra
+from desispec.scripts.tile_redshifts import get_tile_redshift_relpath, get_tile_redshift_script_suffix
+from redrock.external.desi import rrdesi
+
+log = get_logger(level=INFO, timestamp=True)
+
+stop_imports = time.time()
+
+
+def difference_camwords(fullcamword, badcamword):
+    '''Borrowed from desispec to remove noisy log message
+    
+    See desispec.io.util.difference_camwords
+    '''
+    full_cameras = decode_camword(fullcamword)
+    bad_cameras = decode_camword(badcamword)
+    for cam in bad_cameras:
+        if cam in full_cameras:
+            full_cameras.remove(cam)
+        # else:
+        #     log.info(f"Can't remove {cam}: not in the fullcamword. fullcamword={fullcamword}, badcamword={badcamword}")
+    return create_camword(full_cameras)
+
+
+def split_cameras_by_petal(cameras):
+    '''Splits a list of camera strings into a dictionary by petal.
+
+    >>> split_cameras_by_petal(decode_camword('a0b12z2'))
+        {'0': ['b0', 'r0', 'z0'], '1': ['b1'], '2': ['b2', 'z2']}
+    
+    where 
+    
+    >>> decode_camword('a0b12z2')
+        ['b0', 'b1', 'b2', 'r0', 'z0', 'z2']
+
+    Args:
+        cameras (list): a list of camera strings
+
+    Returns:
+        A dictionary keyed by spectro strings whose corresponding values
+        are lists of camera strings.
+    '''
+    cams_by_petal = dict()
+    for camera in cameras:
+        petal = camera[-1]
+        petal_cams = cams_by_petal.get(camera[-1], [])
+        petal_cams.append(camera)
+        cams_by_petal[petal] = petal_cams
+    return cams_by_petal
+
+def desi_preburner(night, expid, badamps=None):
+    '''Performs initial desi_proc steps for the provided (night, expid). Creates filesystem directories and
+    runs assemble_fibermap step once so that subsequent steps in the pipeline for this (night, expid) can be
+    split by spectro and run in parallel.
+
+    Args:
+        night (str): YEARMMDD night
+        expid (str): expousre id
+        badamps (str, None): a string of badamps to pass to assemble_fibermap
+
+    Returns:
+        None
+    '''
+    preprocdir = os.path.dirname(findfile('preproc', night, expid, 'b0'))
+    expdir = os.path.dirname(findfile('frame', night, expid, 'b0'))
+    os.makedirs(preprocdir, exist_ok=True)
+    os.makedirs(expdir, exist_ok=True)
+
+    outfile = findfile('fibermap', night, expid)
+    if not os.path.exists(outfile):
+        outfile = os.path.join(preprocdir, os.path.basename(outfile))
+        # log.info('Creating fibermap {}'.format(fibermap))
+        # cmd = f'assemble_fibermap -n {night} -e {expid} -o {outfile}'
+        # if badamps is not None:
+        #     cmd += ' --badamps={}'.format(badamps)
+        # runcmd(cmd, inputs=[], outputs=[outfile])
+        fibermap = assemble_fibermap(int(night), int(expid), badamps=badamps, force=False)
+        tmpfile = outfile+'.tmp'
+        fibermap.write(tmpfile, overwrite=False, format='fits')
+        os.rename(tmpfile, outfile)
+        # log.info(f'Wrote {outfile}')
+
+    fibermap_ok = os.path.exists(outfile)
+
+    #- Some commissioning files didn't have coords* files that caused assemble_fibermap to fail
+    #- these are well known failures with no other solution, so for those, just force creation
+    #- of a fibermap with null coordinate information
+    if not fibermap_ok and int(night) <	20200310:
+        # log.info("Since night is before 20200310, trying to force fibermap creation without coords file")
+        # cmd += ' --force'
+        # runcmd(cmd, inputs=[], outputs=[outfile])
+        fibermap = assemble_fibermap(int(night), int(expid), badamps=badamps, force=True)
+        tmpfile = outfile+'.tmp'
+        fibermap.write(tmpfile, overwrite=False, format='fits')
+        os.rename(tmpfile, outfile)
+        
+        fibermap_ok = os.path.exists(outfile)
+    
+
+def launch_desi_proc(comm, func, procstage, night, expids, cameras, dryrun=False, timingsuffix=None, gpuspecter=True, gpuextract=True):
+    '''A helper function for launching desi_proc/desi_proc_joint_fit for an observation.
+
+    Args:
+        comm (mpi4py.MPI.Comm): MPI communicator
+        func (function): desispec.scripts.proc or desispec.scripts.proc_joint_fit
+        procstage (str): ('prestdstar', 'stdstarfit', 'poststdstar')
+        night (str): YEARMMDD night
+        expids (list): list of exposure ids
+        cameras (str): camword
+        dryrun (bool): only print command string, do not call providied func
+        timingsuffix (str): suffix to append to timing file
+        gpuspecter (bool): use gpu_specter for extractions
+        gpuextract (bool): use gpu for extraction and std star fitting
+
+    Returns:
+        None
+    '''
+    #- common options
+    cmd = f'{func.__name__} --traceshift --night {night} --cameras {cameras}'
+    #- TODO: The user should probably just specify extract_size
+    if gpuspecter:
+        cluster_name = os.environ.get('SLURM_CLUSTER_NAME')
+        if gpuextract:
+            if cluster_name == 'escori':
+                #- CoriGPU
+                #- 2 per GPU + 2 for IO
+                extract_size = 10
+            elif cluster_name == 'perlmutter':
+                #- Perlmutter GPU
+                #- 5 per GPU + 2 for IO
+                extract_size = 22
+            else:
+                raise RuntimeError(f'Unexpected SLURM_CLUSTER_NAME value: {cluster_name}')
+        else:
+            #- cpu version of gpu specter
+            extract_size = 16
+    else:
+        #- specter expects 1 rank per bundle
+        extract_size = 20
+    #- desi proc stage options
+    procstage_opts = {
+        'prestdstar' : f' --nostdstarfit --nofluxcalib --expid {expids[0]} --extract-size {extract_size}',
+        'stdstarfit' : f' --obstype science --mpistdstars --expids {",".join(map(str, expids))}',
+        'poststdstar': f' --nostdstarfit --noprestdstarfit --expid {expids[0]}',
+    }
+    cmd += procstage_opts[procstage]
+
+    if procstage == 'prestdstar' and gpuspecter:
+        cmd += ' --gpuspecter'
+
+    #- overloaded for pre and stdstar fit
+    if gpuextract:
+        cmd += ' --gpuextract'
+
+    #- ensure GPU is disabled for stdstarfit if gpuextract is not True
+    if procstage == 'stdstarfit' and not gpuextract:
+        import desispec.fluxcalibration
+        desispec.fluxcalibration.use_gpu = False
+
+    timingfile = f'{procstage}-{night}-{expids[0]}-{cameras}-timing'
+    if timingsuffix is not None:
+        timingfile += f'-{timingsuffix}'
+    cmd += f' --timingfile {timingfile}.json'
+    #- parse command string through argument parser
+    cmdargs = cmd.split()[1:]
+    args = func.parse(cmdargs)
+    #- run command using provided MPI communicator
+    if comm.rank == 0:
+        log.info(f'{func.__name__} {night=} {expids=} {comm.size=}')
+        log.info(cmd)
+    if not dryrun:
+        func.main(args, comm)
+
+
+class NightTileProcessor():
+    def __init__(self, gpuspecter=False, gpuextract=False, dryrun=False, timingsuffix=None, keepcframe=False):
+        '''Pipeline steps to process a night-tile.
+        
+        Args:
+            gpuspecter (bool): whether to use gpu_specter instead of (CPU) specter for extaction
+            gpuextract (bool): whether to use GPU in extraction and std star fitting step
+            dryrun (bool):
+            timingsuffix (str):
+            keepcframe (bool): don't cleanup cframe files, in case you want to run redshifts.
+        '''
+        self.gpuspecter = gpuspecter
+        self.gpuextract = gpuextract
+        self.dryrun = dryrun
+        self.timingsuffix = timingsuffix
+        self.keepcframe = keepcframe
+
+    def process_night_tile(self, comm, night, tileid, expids, camword):
+        '''Process a exposures for the specified night-tile.
+
+        Args:
+            comm (mpi4py.MPI.Comm)
+            night (str):
+            tileid (str):
+            expids (list):
+            camword (str):
+
+        Returns:
+            None
+        '''
+        #- run desiproc prestdstar over exps
+        for expid in expids:
+            launch_desi_proc(
+                comm, proc, 'prestdstar', night, [expid], camword,
+                dryrun=self.dryrun, timingsuffix=self.timingsuffix, 
+                gpuspecter=self.gpuspecter, gpuextract=self.gpuextract
+            )
+        #- run joint stdstar fit using all exp for this night-tile
+        launch_desi_proc(
+            comm, proc_joint_fit, 'stdstarfit', night, expids, camword,
+            dryrun=self.dryrun, timingsuffix=self.timingsuffix, 
+            gpuextract=self.gpuextract
+        )
+        #- run desiproc poststdstar over exps
+        for expid in expids:
+            launch_desi_proc(
+                comm, proc, 'poststdstar', night, [expid], camword,
+                dryrun=self.dryrun, timingsuffix=self.timingsuffix, 
+                gpuextract=False
+            )
+        #- run redshifts
+        # desi_nightly_redshifts(comm=comm, night=night, tileid=tileid, group='pernight')
+
+        #- cleanup
+        remove_kinds = [
+            'preproc',
+            'psf',
+            'frame',
+            'sky',
+            'sframe',
+            'stdstars',
+            'fluxcalib',
+        ]
+        if not self.keepcframe:
+            remove_kinds.append('cframe')
+        if comm.rank == 0:
+            for expid in expids:
+                for camera in decode_camword(camword):
+                    for kind in remove_kinds:
+                        spec = int(camera[-1])
+                        filename = findfile(kind, night, expid, camera, spectrograph=spec)
+                        if os.path.exists(filename):
+                            log.info(f'removing {filename}')
+                            os.remove(filename)
+
+
+def process_redshift_task(comm, task, jobid=None):
+    '''Runs pipeline steps to produce cumulative redshifting results
+
+    Args:
+        comm (mpi4py.MPI.Comm): MPI communicator
+        task (RedshiftTask):
+        jobid (str, None):
+
+    Returns:
+        None
+    '''
+    group = 'cumulative'
+    rank = comm.rank
+    size = comm.size
+
+    timer = desiutil.timer.Timer(silent=(rank>0))
+
+    #- setup tile task
+    timer.start('setup')
+    # spectros = list(range(10))
+    spectros = list(task.spectros)
+    reduxdir = desispec.io.specprod_root()
+    outdir = os.path.join(reduxdir, get_tile_redshift_relpath(task.tileid, group, night=task.night, expid=None))
+    suffix = get_tile_redshift_script_suffix(task.tileid, group, night=task.night, expid=None)
+    if rank == 0:
+        os.makedirs(outdir, exist_ok=True)
+    timer.stop('setup')
+    comm.barrier()
+    timer.start('group')
+    for spectro in spectros[rank::size]:
+        spectra = f'{outdir}/spectra-{spectro}-{suffix}.fits'
+        if os.path.exists(spectra):
+            log.info(f"{os.path.basename(spectra)} already exists, skipping grouping")
+        else:
+            cframes = list()
+            for night, expid in zip(task.nights, task.expids):
+                cframes += glob.glob(f'{reduxdir}/exposures/{night}/{expid:08d}/cframe-[brz]{spectro}-{expid:08d}.fits')
+                # everest_redux = '/global/cfs/cdirs/desi/spectro/redux/everest'
+                # cframes += glob.glob(f'{everest_redux}/exposures/{night}/{expid:08d}/cframe-[brz]{spectro}-{expid:08d}.fits')
+            if len(cframes) > 0:
+                cframes = ' '.join(cframes)
+                cmd = f"desi_group_spectra --inframes {cframes} --outfile {spectra}"
+                log.info(cmd)
+                options = cmd.split()[1:]
+                args = group_spectra.parse(options)
+                group_spectra.main(args, comm=None)
+            else:
+                log.error(f"no input cframes for tile {task.tileid} spectrograph {spectro}, skipping grouping")
+    timer.stop('group')
+    comm.barrier()
+    timer.start('coadd')
+    for spectro in spectros[rank::size]:
+        spectra = f'{outdir}/spectra-{spectro}-{suffix}.fits'
+        coadd = f'{outdir}/coadd-{spectro}-{suffix}.fits'
+        if os.path.exists(coadd):
+            log.info(f"{os.path.basename(coadd)} already exists, skipping coadd")
+        elif os.path.exists(spectra):
+            cmd = f"desi_coadd_spectra --onetile --nproc 2 -i {spectra} -o {coadd}"
+            log.info(cmd)
+            options = cmd.split()[1:]
+            args = coadd_spectra.parse(options)
+            coadd_spectra.main(args)
+        else:
+            log.error(f"missing {os.path.basename(spectra)}, skipping coadd")
+    timer.stop('coadd')
+    comm.barrier()
+    timer.start('redshifts')
+    #- rrdesi is mpi parallel
+
+    mempool = cupy.get_default_memory_pool()
+    log.info(f"{comm.rank=} {mempool.used_bytes()} {mempool.total_bytes()}")
+    mempool.free_all_blocks()
+    log.info(f"{comm.rank=} {mempool.used_bytes()} {mempool.total_bytes()}")
+
+    for spectro in spectros:
+        coadd = f'{outdir}/coadd-{spectro}-{suffix}.fits'
+        redrock = f'{outdir}/redrock-{spectro}-{suffix}.fits'
+        rrdetails = f'{outdir}/rrdetails-{spectro}-{suffix}.h5'
+        if os.path.exists(redrock):
+            if rank == 0: log.info(f"{os.path.basename(redrock)} already exists, skipping redshifts")
+        elif os.path.exists(coadd):
+            cmd = f"rrdesi_mpi -i {coadd} -o {redrock} -d {rrdetails} --gpu --max-gpuprocs 4"
+            options = cmd.split()[1:]
+            if rank == 0: log.info(cmd)
+            rrdesi(options=options, comm=comm)
+        else:
+            if rank == 0: log.error(f"ERROR: missing {os.path.basename(coadd)}, skipping redshifts")
+    timer.stop('redshifts')
+
+    timers = comm.gather(timer, root=0)
+
+    if rank == 0:
+        stats = desiutil.timer.compute_stats(timers)
+        log.info('Timing summary statistics:\n' + json.dumps(stats, indent=2))
+        specword = ''.join(map(str, sorted(spectros)))
+        timingfile = f'redshifts-{task.tileid}-{specword}-timing-{jobid}.json'
+        tmpfile = timingfile + '.tmp'
+        with open(tmpfile, 'w') as fx:
+            json.dump(stats, fx, indent=2)
+        os.rename(tmpfile, timingfile)
+
+    #- cleanup
+    if comm.rank == 0:
+        for spectro in spectros:
+            filenames = [
+                f'{outdir}/spectra-{spectro}-{suffix}.fits',
+                f'{outdir}/coadd-{spectro}-{suffix}.fits',
+                f'{outdir}/rrdetails-{spectro}-{suffix}.h5',
+                # f'{outdir}/redrock-{spectro}-{suffix}.fits',
+            ]
+            for night, expid in zip(task.nights, task.expids):
+                filenames += glob.glob(f'{reduxdir}/exposures/{night}/{expid:08d}/cframe-[brz]{spectro}-{expid:08d}.fits')
+            for filename in filenames:
+                if os.path.exists(filename):
+                    log.info(f'removing {filename}')
+                    os.remove(filename)
+                    
+import abc
+from dataclasses import dataclass
+
+@dataclass
+class Task(abc.ABC):
+    """Represents a generic task"""
+    weight: float
+    name: str
+
+@dataclass
+class NightTileTask:
+    """Represents a single task to process a unique night-tile"""
+    night: str
+    tileid: str
+    expids: list
+    camword: str
+    weight: float
+    name: str
+
+@dataclass
+class PreBurnerTask:
+    """Represents a preburner task"""
+    night: str
+    tileid: str
+    expid: str
+    weight: float
+    name: str
+
+@dataclass
+class RedshiftTask:
+    """Represents a cumulative redshift task for tile"""
+    night: str
+    tileid: str
+    nights: list
+    expids: list
+    spectros: list
+    weight: float
+    name: str
+
+@dataclass
+class NightTileTaskList:
+    """A list of night tile tasks"""
+    tasks: List[NightTileTask]
+
+@dataclass
+class TileTaskList:
+    """A list of tile tasks"""
+    tasks: List[RedshiftTask]
+
+def read_exptables(exptable_pattern):
+    """Reads exposure table files matching the provided pattern
+    
+    Args:
+        extable_pattern (str): glob filename pattern
+
+    Returns:
+        exptable (pd.Dataframe): concatenated exposure table
+    """
+    exptables = list()
+    for exptable_filename in sorted(glob.glob(exptable_pattern)):
+        exptable = pd.read_csv(exptable_filename)
+        keep = exptable['OBSTYPE'] == 'science'
+        keep &= exptable['EXPTIME'] >= 200
+        keep &= exptable['LASTSTEP'] == 'all'
+        keep &= exptable['BADAMPS'].isnull()
+        exptable['FINALCAMWORD'] = exptable.apply(
+            lambda r: difference_camwords(r['CAMWORD'], str(r['BADCAMWORD'])),
+            axis=1
+        )
+        exptable = exptable[keep]
+        exptable['NIGHTTILECAMWORD'] = None
+        # loop over night-tile
+        for (night, tileid), grp in exptable.groupby(['NIGHT', 'TILEID']):
+            #- Create list of exposure ids
+            expids = list(grp['EXPID'])
+            #- Each exposure has a different finalcamword
+            expcam_map = dict(zip(grp['EXPID'], grp['FINALCAMWORD']))
+            #- Combine camwords
+            nighttile_camword = 'a0123456789'
+            for camword in grp['CAMWORD']:
+                badcamword = difference_camwords(nighttile_camword, str(camword))
+                nighttile_camword = difference_camwords(nighttile_camword, badcamword)
+            for badcamword in grp['BADCAMWORD']:
+                nighttile_camword = difference_camwords(nighttile_camword, str(badcamword))
+                
+            for i, row in grp.iterrows():
+                exptable.at[i, 'NIGHTTILECAMWORD'] = nighttile_camword
+        exptables.append(exptable[['EXPID','NIGHT','TILEID','NIGHTTILECAMWORD']])
+    return pd.concat(exptables, ignore_index=True)
+
+def create_task_list(tile_groups, petal_tasks):
+    """Creates a task lists based on the provided tile_group
+
+    Args:
+        tile_groups (pd.Groups)
+        petal_tasks (bool)
+
+    Returns:
+        A tuple (night_tile_tasks, redshift_tasks)
+    """
+    night_tile_tasks = list()
+    redshift_tasks = list()
+    for tileid, tile_group in tile_groups:
+        #- store the set of petals used for extraction
+        petals = set()
+        for night, night_group in tile_group.groupby('NIGHT'):
+            #- Create list of exposure ids
+            expids = list(night_group['EXPID'])
+            camword = night_group.iloc[0]['NIGHTTILECAMWORD']
+            cameras_by_petal = split_cameras_by_petal(decode_camword(camword))
+            petals.update([int(k) for k in cameras_by_petal.keys()])
+            if petal_tasks and len(expids) > 1:
+                for petal, cameras in cameras_by_petal.items():
+                    #- weight is relative to a full 30 frame exposure
+                    petal_factor = 0.1 #- 10 petals
+                    channel_factor = 1.0/3.0 #- 3 channels
+                    overhead_factor = 2.5
+                    weight = overhead_factor*petal_factor*channel_factor*len(cameras)*len(expids)
+                    name = f'proc-{night}-{tileid}-{petal}'
+                    task = NightTileTask(int(night), int(tileid), expids, create_camword(cameras), weight, name)
+                    night_tile_tasks.append(task)
+            else:
+                #- weight is relative to a full 30 frame exposure
+                weight = len(decode_camword(camword)) / 30.0
+                name = f'proc-{night}-{tileid}'
+                task = NightTileTask(int(night), int(tileid), expids, camword, weight, name)
+                night_tile_tasks.append(task)
+        #- Cumulative redshift task uses final night in name
+        nights = list(tile_group['NIGHT'])
+        expids = list(tile_group['EXPID'])
+        night = max(nights)
+        if petal_tasks:
+            for petal in petals:
+                name = f'redshifts-{tileid}-{night}-{petal}'
+                weight = 0.1
+                redshift_tasks.append(RedshiftTask(night, tileid, nights, expids, [petal], weight, name))
+        else:
+            name = f'redshifts-{tileid}-{night}'
+            weight = 1.0
+            redshift_tasks.append(RedshiftTask(night, tileid, nights, expids, list(petals), weight, name))
+    return night_tile_tasks, redshift_tasks
+
+def initialize_tasks(exptable_pattern=None, tileid=None, task_seed=None, task_step=None, max_tasks=None, petal_tasks=False, weak_numnodes=None, weak_maxnodes=None):
+    """Read exposure tables and apply filteres to initialize task lists
+
+    Args:
+        exptable_pattern (str)
+        tileid (list)
+        task_seed (str)
+        task_step (int, None)
+        max_tasks (int, None)
+        petal_tasks (bool)
+
+    Returns:
+        A tuple of (preburner_tasks, night_tile_tasks, redshift_tasks) task lists
+    """
+    if exptable_pattern is None:
+        reduxdir = desispec.io.specprod_root()
+        exptable_pattern = f'{reduxdir}/exposure_tables/202???/exposure_table_202?????.csv'
+    log.info(f'Reading exptables matching pattern: {exptable_pattern}')
+    exptable = read_exptables(exptable_pattern)
+
+    if tileid is not None:
+        #- Ignore duplicate tileids
+        keep_tileids = set(tileid)
+        log.info(f'Keeping tiles: {keep_tileids}')
+        #- Filter exptable
+        exptable = exptable[exptable['TILEID'].isin(keep_tileids)]
+
+    tile_groups = list(exptable.groupby('TILEID'))
+    if task_seed is not None:
+        import random
+        random.seed(task_seed)
+        random.shuffle(tile_groups)
+    if task_step > 1:
+        tile_groups = tile_groups[::task_step]
+    if max_tasks > 0:
+        #- Limit total number of tasks
+        tile_groups = tile_groups[:max_tasks]
+    if weak_numnodes is not None:
+        node_frac = weak_numnodes / float(weak_maxnodes)
+        log.info(f'Weak scaling node fraction: {node_frac} ({weak_numnodes}/{weak_maxnodes})')
+        #- Use total number of exposures to set target weight
+        weight_target = math.ceil(len(exptable) * node_frac)
+        weight = 0
+        keep_tile_groups = list()
+        for tile_group in tile_groups:
+            if weight >= weight_target:
+                break
+            tile_weight = len(tile_group[1])
+            if weight + tile_weight <= weight_target:
+                keep_tile_groups.append(tile_group)
+                weight += tile_weight
+        log.info(f'Weak scaling workload (target): {weight} ({weight_target})')
+        tile_groups = keep_tile_groups
+
+    log.info(f'Number tiles: {len(tile_groups)}')
+
+    #- Create tasks from tile_groups
+    night_tile_tasks, redshift_tasks = create_task_list(tile_groups, petal_tasks)
+
+    log.info(f'Number of tile tasks: {len(redshift_tasks)}')
+    with open("tile_tasks.json", "w") as outfile:
+        json.dump(asdict(TileTaskList(redshift_tasks)), outfile, indent=2)
+        
+    log.info(f'Number night-tile tasks: {len(night_tile_tasks)}')
+    with open("night_tile_tasks.json", "w") as outfile:
+        json.dump(asdict(NightTileTaskList(night_tile_tasks)), outfile, indent=2)
+
+    preburner_tasks = []
+    for tileid, tile_group in tile_groups:
+        nights = list(tile_group['NIGHT'])
+        expids = list(tile_group['EXPID'])
+        for night, expid in zip(nights, expids):
+            preburner = PreBurnerTask(night, tileid, expid, 1, f'preburner-{night}-{tileid}-{expid}')
+            preburner_tasks.append(preburner)
+    log.info(f'Number of preburner tasks: {len(preburner_tasks)}')
+
+    return preburner_tasks, night_tile_tasks, redshift_tasks
+
+@dataclass
+class TaskPartition():
+    tasks: list = field(default_factory=list)
+    weight: float = 0
+    scale_factor: float = 1
+
+    def score(self):
+        """Returns the score of the partition"""
+        return (self.weight*self.scale_factor, self.scale_factor)
+
+    def potential_score(self, task):
+        """Returns the score including if task were added to this partition"""
+        return ((self.weight + task.weight)*self.scale_factor, self.scale_factor)
+
+    def add_task(self, task):
+        """Appends task and updates weight"""
+        self.tasks.append(task)
+        self.weight += task.weight
+
+
+def partition_tasks(tasks, num_partitions, scale_factors=None):
+    """Divides the provided tasks into the specified number of partitions"""
+    #- Sort tasks based on weight (highest to lowest)
+    ordered_tasks = sorted(tasks, key=lambda x: x.weight, reverse=True)
+    #- If scale_factors is not provided assume they are equal
+    if scale_factors is None:
+        scale_factors = [1]*num_partitions
+    #- Initialize partitioned task lists
+    partitions = [TaskPartition(scale_factor=x) for x in scale_factors]
+    for task in ordered_tasks:
+        #- Identify "lightest" partition to receive task
+        partition = min(partitions, key=lambda p: p.potential_score(task))
+        #- Add task to a partition
+        partition.add_task(task)
+    return partitions
+
+
+class Slots():
+
+    def __init__(self, comm, use_gpu=True, nodes_per_slot=1, use_cpu_half=False):
+        """Splits the provided to comm into subcommunicators across a groups of nodes (slots) 
+        for processing tasks.
+
+        Args:
+            comm (mpi4py.MPI.Comm): MPI communicator spanning nodes to use for slots (typically, WORLD_COMM).
+            use_gpu (bool): whether or not to use GPUs.
+            nodes_per_slot (int): specify the number of nodes to use per slot.
+            use_cpu_half (bool): split nodes into two halves, the second half being cpu-only (experimental!).
+        """
+        
+        if use_gpu:
+            assert nodes_per_slot == 1, "when using GPU, nodes_per_slot must be 1"
+
+        self.comm = comm
+        self.nodes_per_slot = nodes_per_slot
+        self.use_cpu_half = use_cpu_half
+        self.tasks = list()
+
+        self.node = os.environ.get('SLURMD_NODENAME')
+        #- SLURM_NODEID is node index
+        self.node_index = int(os.environ.get('SLURM_NODEID'))
+        #- SLURM_LOCALID is local node rank
+        self.node_rank = int(os.environ.get("SLURM_LOCALID"))
+        #- TODO: this is not great. srun doesn't change this env variable
+        self.node_size = int(os.environ.get("SLURM_NTASKS_PER_NODE"))
+
+        #- experimental!
+        if self.use_cpu_half:
+            self.node_size = (self.node_size//2)
+            if self.node_rank < self.node_size:
+                self.node += "-0"
+            else:
+                #- second half ranks use cpu only
+                self.node += "-1"
+                use_gpu = False
+        self.use_gpu = use_gpu
+
+        self.nodes = list(sorted(set(comm.allgather(self.node))))
+        self.nnodes = len(self.nodes)
+
+        #- nnodes must be divisible by nodes_per_slot
+        assert self.nnodes % nodes_per_slot == 0, f"invalid {nodes_per_slot=} with {self.nnodes=}"
+
+        #- assign ranks to slots
+        self.nslots = self.nnodes // nodes_per_slot
+        self.slot_size = nodes_per_slot * self.node_size
+        self.slot_rank = comm.rank % self.slot_size
+        self.slot_index = self.node_index // nodes_per_slot
+        #- Split comm into groups for each slot
+        self.intra_slot_comm = comm.Split(color=self.slot_index, key=self.slot_rank)
+        #- Split comm into two groups:
+        #-   the first group includes rank 0 of each intra_slot_comm and is used to scatter tasks across slots.
+        #-   the second group includes all other ranks but is not used for anything.
+        self.inter_slot_comm = comm.Split(color=self.slot_rank, key=self.slot_index)
+
+        #- if using cpu half, add cpu partition penalties 
+        self.slot_scale_factors = None
+        if self.use_cpu_half:
+            #- by construction, every other slot is gpu/cpu
+            self.slot_scale_factors = [1 + i%2 for i in range(self.nslots)]
+
+
+    def distribute(self, tasks, name=None):
+        """Distributes tasks
+
+        Args:
+            tasks (list): a list of tasks to distribute
+        """
+        #- Partition tasks into slots
+        if self.comm.rank == 0:
+            partitions = partition_tasks(tasks, self.nslots, self.slot_scale_factors)
+            totalweight = sum([p.weight for p in partitions])
+            ntaskstotal = len(tasks)
+            partitioned_tasks = [p.tasks for p in partitions]
+            log.info(f"{self.comm.rank=} {ntaskstotal=} {totalweight=}")
+
+            #- Save task partition to file
+            slot_data = dict(slots=list())
+            for i, p in enumerate(partitions):
+                slot_data["slots"].append(dict(
+                    task_partition = asdict(p),
+                    slot_index = i,
+                    nodes = self.nodes[i*self.nodes_per_slot:(i+1)*self.nodes_per_slot]
+                ))
+            if name is not None:
+                with open(f"{name}.json", "w") as outfile:
+                    json.dump(slot_data, outfile, indent=2)
+        else:
+            partitioned_tasks = None
+
+        #- Scatter tasks among slots
+        if self.slot_rank == 0:
+            scattered_tasks = self.inter_slot_comm.scatter(partitioned_tasks, root=0)
+            ntasks = len(scattered_tasks)
+            log.info(f"{self.comm.rank=} {self.node=} {ntasks=}")
+            #- Drop a crumb for each task
+            for task in scattered_tasks:
+                log.info(f"{self.comm.rank=} {self.node_index=} {self.slot_index=} {task=}")
+                crumb = f"{task.name}.crumb"
+                with open(crumb, 'w') as f:
+                    f.write(f"slot={self.slot_index} todo\n")
+        else:
+            scattered_tasks = None
+        #- Broadcast tasks within a slot
+        self.tasks = self.intra_slot_comm.bcast(scattered_tasks, root=0)
+
+    def map(self, func):
+        '''Applies func to tasks using each slots' communicator
+
+        Args:
+            func (callable): the function to map over tasks. func should have (comm, task) arguments.
+        '''
+        for task in self.tasks:
+            #- update crumb
+            if self.slot_rank == 0:
+                crumb = f"{task.name}.crumb"
+                with open(crumb, 'w') as f:
+                    now = datetime.datetime.now().isoformat()
+                    f.write(f"slot={self.slot_index} started at {now}\n")
+            #- Apply func to task
+            func(self.intra_slot_comm, task)
+            #- clean up crumbs
+            if self.slot_rank == 0:
+                crumb = f"{task.name}.crumb"
+                log.info(f"slot={self.slot_index} cleaning up {crumb=}")
+                if os.path.exists(crumb):
+                    os.remove(crumb)
+
+
+def main():
+
+    parser = argparse.ArgumentParser(allow_abbrev=False)
+    parser.add_argument("--starttime", type=str, help='start time; use "--starttime `date +%%s`"')
+    parser.add_argument("--exptable", type=str, default=None, help="exptable glob pattern")
+    parser.add_argument("--petal-tasks", action="store_true", help="Divide night-tile tasks by petals")
+    parser.add_argument("--gpu", action="store_true", help="use gpu")
+    parser.add_argument("--dryrun", action="store_true", help="only print commands")
+    parser.add_argument("--max-weight", type=float, default=0, help="tasks with weight above max are ignored")
+    parser.add_argument("--use-cpu-half", action="store_true", help="use extra cpu ranks")
+    parser.add_argument("--nodes-per-slot", type=int, default=1, help="number of nodes per processing slot")
+    parser.add_argument("--max-tasks", type=int, default=0, help="max number of tasks")
+    parser.add_argument("--use-pkl5-comm", action="store_true", help="Use pkl5 comm (experimental)")
+    parser.add_argument("--task-seed", type=int, default=None, help="Use to randomly shuffle task list")
+    parser.add_argument("--task-step", type=int, default=1, help="Use to thin the task list. Ex: 10 -> 10%%, 100 -> 1%%")
+    parser.add_argument("--redshifts", action="store_true", help="do redshift tasks")
+    parser.add_argument("--tileid", type=int, nargs='+', help="tile IDs")
+    parser.add_argument("--no-mpi", action="store_true", help="Disable MPI. Will not process any tasks")
+    parser.add_argument("--skip-night-tile", action="store_true", help="Skip night tile steps")
+    parser.add_argument("--weak-numnodes", type=int, default=None, help="Weak scaling number of nodes")
+    parser.add_argument("--weak-maxnodes", type=int, default=None, help="Weak scaling max nodes")
+    args = parser.parse_args()
+
+    #- Initialize MPI
+    start_mpi_connect = time.time()
+    if args.no_mpi:
+        comm = None
+        rank = 0
+        size = 1
+    else:
+        from mpi4py import MPI
+        if args.use_pkl5_comm:
+            # https://mpi4py.readthedocs.io/en/latest/mpi4py.util.pkl5.html
+            from mpi4py.util import pkl5
+            comm = pkl5.Intracomm(MPI.COMM_WORLD)
+        else:
+            comm = MPI.COMM_WORLD
+        # comm.Set_errhandler(MPI.ERRORS_ARE_FATAL)
+        rank = comm.rank
+        size = comm.size
+    stop_mpi_connect = time.time()
+
+    timer = desiutil.timer.Timer(silent=(rank>0))
+
+    #- Fill in timing information for steps before we had the timer created
+    if args.starttime is not None:
+        timer.start('startup', starttime=args.starttime)
+        timer.stop('startup', stoptime=start_imports)
+
+    timer.start('imports', starttime=start_imports)
+    timer.stop('imports', stoptime=stop_imports)
+
+    timer.start('mpi_connect', starttime=start_mpi_connect)
+    timer.stop('mpi_connect', stoptime=stop_mpi_connect)
+
+    #- Initialize task list from exposure table files. Apply filtering from CLI options.
+    timer.start('init_tasks')
+    jobid = os.environ.get('SLURM_JOB_ID', None)
+    if rank == 0:
+        preburner_tasks, night_tile_tasks, redshift_tasks = initialize_tasks(
+            exptable_pattern=args.exptable, tileid=args.tileid, task_seed=args.task_seed, task_step=args.task_step, 
+            max_tasks=args.max_tasks, petal_tasks=args.petal_tasks,
+            weak_numnodes=args.weak_numnodes, weak_maxnodes=args.weak_maxnodes
+        )
+    else:
+        preburner_tasks = None
+        night_tile_tasks = None
+        redshift_tasks = None
+    timer.stop('init_tasks')
+
+    if comm is not None:
+        comm.barrier()
+        #- Create slots for task processing
+        timer.start('init_slots')
+        slots = Slots(comm, use_gpu=args.gpu, nodes_per_slot=args.nodes_per_slot, use_cpu_half=args.use_cpu_half)
+        timer.stop('init_slots')
+
+        if not args.skip_night_tile:
+            #- Preburner tasks use top-level comm instead of slots
+            timer.start('preburner_tasks')
+            preburner_tasks = comm.bcast(preburner_tasks, root=0)
+            for preburner in preburner_tasks[rank::size]:
+                desi_preburner(preburner.night, preburner.expid)
+            timer.stop('preburner_tasks')
+            comm.barrier()
+
+            timer.start('night_tile_tasks')
+            #- Distribute tasks among slots
+            slots.distribute(night_tile_tasks, name="night_tile_partitions")
+            #- Configure the function we will use to process each task
+            #- note that the processor will be configured differently for slots depending on the `use_gpu` attribute
+            ntp = NightTileProcessor(gpuspecter=args.gpu, gpuextract=slots.use_gpu, dryrun=args.dryrun, timingsuffix=jobid, keepcframe=args.redshifts)
+            def process_night_tile(comm, task):
+                ntp.process_night_tile(comm, task.night, task.tileid, task.expids, task.camword)
+            #- Process tasks
+            slots.map(process_night_tile)
+            timer.stop('night_tile_tasks')
+            comm.barrier()
+
+        if args.redshifts:
+            timer.start('tile_tasks')
+            slots.distribute(redshift_tasks, name="redshift_partitions")
+            #- wrap process_redshift_task to sneak jobid in there
+            def process_tile(comm, task):
+                process_redshift_task(comm, task, jobid)
+            slots.map(process_tile)
+            timer.stop('tile_tasks')
+        timers = comm.gather(timer, root=0)
+    else:
+        timers = [timer, ]
+
+    if rank == 0:
+        stats = desiutil.timer.compute_stats(timers)
+        log.info('Timing summary statistics:\n' + json.dumps(stats, indent=2))
+        timingfile = f'scalerun-timing-{jobid}.json'
+        tmpfile = timingfile + '.tmp'
+        with open(tmpfile, 'w') as fx:
+            json.dump(stats, fx, indent=2)
+        os.rename(tmpfile, timingfile)
+
+    log.info('All done at {}'.format(time.asctime()))
+
+    
+if __name__ == "__main__":
+    main()
