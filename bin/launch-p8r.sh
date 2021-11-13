@@ -1,5 +1,7 @@
 #!/bin/bash -l
 
+set -e
+
 module load PrgEnv-gnu
 module load cpe-cuda
 module load cuda/11.3.0
