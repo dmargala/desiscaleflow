@@ -29,7 +29,7 @@ LOGBASE=$(basename $1)
 
 LOGFILE=${LOGDIR}/${SLURM_NODEID}/${LOGBASE}.${SLURM_LOCALID}
 
-if [$SLURM_LOCALID -eq 0]; then
+if [ $SLURM_LOCALID -eq 0 ]; then
     mkdir -p $(dirname $LOGFILE)
 fi
 
