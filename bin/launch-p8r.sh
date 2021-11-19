@@ -24,6 +24,9 @@ export XDG_CONFIG_HOME=$SCRATCH/config
 mkdir -p $XDG_CACHE_HOME/astropy
 mkdir -p $XDG_CONFIG_HOME/astropy
 
+# python -c "import astropy"
+# python -c "from desiutil.iers import freeze_iers; freeze_iers()"
+
 # https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/
 # https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#env-vars
 export CUDA_CACHE_PATH=$SCRATCH/.nv/ComputeCache
