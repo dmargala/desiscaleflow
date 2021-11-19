@@ -29,19 +29,30 @@ echo creating $OUTDIR
 mkdir -p $OUTDIR
 
 #- Create a symlink in DESI_SPECTRO_REDUX tree so pipeline can find outputs
-export SPECPROD=$USER/$NAME
-ln -sf $OUTDIR $DESI_SPECTRO_REDUX/$SPECPROD
+# export SPECPROD=$USER/$NAME
+# ln -sf $OUTDIR $DESI_SPECTRO_REDUX/$SPECPROD
 
 #- Use calibnight from DESI production
-export COMPARE_SPECPROD=everest
-ln -s $DESI_SPECTRO_REDUX/$COMPARE_SPECPROD/calibnight $OUTDIR/calibnight
+REDUX_SOURCE=$DESI_SPECTRO_REDUX
+SPECPROD_SOURCE=everest
+CALIBNIGHT_SOURCE=$REDUX_SOURCE/$SPECPROD_SOURCE/calibnight
+CALIBNIGHT=$OUTDIR/calibnight
+echo linking calibnight dir $CALIBNIGHT_SOURCE to $CALIBNIGHT
+ln -s $CALIBNIGHT_SOURCE $CALIBNIGHT
+
+export DESI_SPECTRO_REDUX=$SCRATCH
+export SPECPROD=$NAME
 
 #- Create a unique directory for crumbs, log files, etc
-cd $SCRATCH
-mkdir -p ${SLURM_JOB_ID}
-cd ${SLURM_JOB_ID}
-mkdir -p log
-LOGFILE=log/slurm-$SLURM_JOB_ID.out
+RUNDIR=$OUTDIR/run
+echo creating run dir at $RUNDIR
+mkdir -p $RUNDIR
+cd $RUNDIR
+
+LOGDIR=$OUTDIR/log
+echo creating log dir at $LOGDIR
+mkdir -p $LOGDIR
+LOGFILE=$LOGDIR/slurm-$SLURM_JOB_ID.out
 
 #- OpenMP Settings
 #- https://www.openmp.org/spec-html/5.1/openmpch6.html
@@ -62,7 +73,7 @@ export CPU_BIND=cores
 export DESI_LOGLEVEL=WARNING
 
 #- Use exposure tables from DESI production
-EXPTABLE=$DESI_SPECTRO_REDUX/$COMPARE_SPECPROD/exposure_tables/202???/exposure_table_*.csv
+EXPTABLE=$REDUX_SOURCE/$SPECPROD_SOURCE/exposure_tables/202???/exposure_table_*.csv
 
 #- Disable glob expansion to prevent $EXPTABLE from being expanded
 set -o noglob
@@ -80,9 +91,7 @@ echo "    $cmd"
 
 time $cmd --starttime `date +%s.%N`
 
-# time srun desi_redirect_output -c $LOGFILE desi_mps_wrapper desi_scale_run --starttime `date +%s.%N` --exptable "$EXPTABLE" --gpu --petal-tasks --task-seed 3333 --max-tasks $MAXTASKS --redshifts
-
 echo "To compare:"
 echo "ls -1 $OUTDIR/tiles/cumulative | sort -n > $(realpath tiles.txt)"
 echo "desi_zcatalog -i $OUTDIR/tiles/cumulative/ -o $OUTDIR/ztile-cumulative-gpu.fits --minimal --tiles $(realpath tiles.txt)"
-echo "desi_zcatalog -i $DESI_SPECTRO_REDUX/$COMPARE_SPECPROD/tiles/cumulative/ -o $OUTDIR/ztile-cumulative-everest.fits --minimal --tiles $(realpath tiles.txt)"
+echo "desi_zcatalog -i $REDUX_SOURCE/$SPECPROD_SOURCE/tiles/cumulative/ -o $OUTDIR/ztile-cumulative-everest.fits --minimal --tiles $(realpath tiles.txt)"
