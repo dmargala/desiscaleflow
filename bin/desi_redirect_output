@@ -24,7 +24,14 @@ done
 # Remove flags that have been processed from arg list
 shift $((OPTIND-1))
 
-LOGFILE=$1.${SLURM_NODEID}.${SLURM_LOCALID}
+LOGDIR=$(dirname $1)
+LOGBASE=$(basename $1)
+
+LOGFILE=${LOGDIR}/${SLURM_NODEID}/${LOGBASE}.${SLURM_LOCALID}
+
+if [$SLURM_LOCALID -eq 0]; then
+    mkdir -p $(dirname $LOGFILE)
+fi
 
 # consume first argument
 shift
