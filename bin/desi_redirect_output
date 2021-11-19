@@ -27,11 +27,7 @@ shift $((OPTIND-1))
 LOGDIR=$(dirname $1)
 LOGBASE=$(basename $1)
 
-LOGFILE=${LOGDIR}/${SLURM_NODEID}/${LOGBASE}.${SLURM_LOCALID}
-
-if [ $SLURM_LOCALID -eq 0 ]; then
-    mkdir -p $(dirname $LOGFILE)
-fi
+LOGFILE=${LOGDIR}/${LOGBASE}.${SLURM_NODEID}.${SLURM_LOCALID}
 
 # consume first argument
 shift
