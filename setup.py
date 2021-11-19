@@ -11,6 +11,7 @@ setup_keywords = dict(
 setup_keywords['scripts'] = [
     'bin/desi_scale_run',
     'bin/desi_redirect_output',
+    'bin/desi_avoid_home'
 ]
 
 setup(**setup_keywords)

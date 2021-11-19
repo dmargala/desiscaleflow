@@ -16,6 +16,8 @@ set -e
 echo "Currently Loaded Modules:"
 module -t list 2>&1 | sed 's/^/    /'
 
+source desi_avoid_home
+
 NAME=scale-run-$SLURM_JOB_ID
 
 #- Writing to perlmutter scratch
