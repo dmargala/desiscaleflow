@@ -1,0 +1,41 @@
+#!/bin/bash -l
+
+# https://docs.python.org/3/using/cmdline.html#envvar-PYTHONNOUSERSITE
+# equivalent to `python -s` instead of `python`
+export PYTHONNOUSERSITE=1
+
+# https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+export XDG_CACHE_HOME=$SCRATCH/cache
+export XDG_CONFIG_HOME=$SCRATCH/config
+
+# https://matplotlib.org/stable/faq/environment_variables_faq.html#environment-variables
+# matplotlib respects XDG
+# export MPLCONFIGDIR=$SCRATCH
+
+# https://docs.astropy.org/en/stable/config/index.html?highlight=xdg_cache_home#getting-started
+# astropy respects XDG
+mkdir -p $XDG_CACHE_HOME/astropy
+mkdir -p $XDG_CONFIG_HOME/astropy
+
+# python -c "import astropy"
+# python -c "from desiutil.iers import freeze_iers; freeze_iers()"
+
+# https://developer.nvidia.com/blog/cuda-pro-tip-understand-fat-binaries-jit-caching/
+# https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#env-vars
+export CUDA_CACHE_PATH=$SCRATCH/.nv/ComputeCache
+
+# undocumented, see https://github.com/cupy/cupy/issues/3887
+export CUPY_CUDA_LIB_PATH=$SCRATCH/cupy/cuda_lib
+
+# https://docs.cupy.dev/en/stable/reference/environment.html#envvar-CUPY_CACHE_DIR
+export CUPY_CACHE_DIR=/tmp/cupy/kernel_cache
+
+# the python module at NERSC adds a path on $HOME to $PATH, undo that
+# split path on : into lines | use grep to filter out the path we do not want | reassemble path
+export PATH=$(tr ":" "\n" <<<"$PATH" | grep -Fxv "$PYTHONUSERBASE/bin" | paste -sd:)
+
+# and finally...
+# $HOME/.nv/nvidia-application-profiles-rc
+# https://download.nvidia.com/XFree86/Linux-x86_64/450.119.03/README/profiles.html
+export HOME=$SCRATCH
+
